@@ -1,493 +1,749 @@
+#define _POSIX_C_SOURCE 200809L
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
-#include <stdarg.h>
-#include <ctype.h>
+#include <unistd.h>
 
+// --- PERSONALISED VALUES FOR IT23695634 ---
 #define PORT 11634
-#define BACKLOG 10
-#define BUFFER_SIZE 4096
-#define MAX_USERNAME 50
-#define MAX_ROOMNAME 50
-#define NID_TAG " NID:6956"
+#define NID_TAG "NID:6956"
+#define REGNO "IT23695634"
 #define LOG_FILE "netmsg_IT23695634.log"
-#define STORAGE_BASE "./storage/IT23695634/"
+#define STORAGE_ROOT "storage/IT23695634"
 
-// ---------- DATA STRUCTURES ----------
-typedef struct Client {
-    int sockfd;
-    char username[MAX_USERNAME];
-    int is_registered;
-    struct Client *next;
-} Client;
+#define MAX_CLIENTS 32
+#define MAX_ROOMS 32
+#define MAX_ROOM_MEMBERS 32
+#define MAX_NAME 32
+#define MAX_LINE 4096
+#define RXBUF_SIZE 8192
+#define MAX_FILENAME 256
+#define MAX_FILE_SIZE (10ULL * 1024ULL * 1024ULL) // 10 MB limit
 
-typedef struct Room {
-    char name[MAX_ROOMNAME];
-    char members[10][MAX_USERNAME]; // Max 10 members per room for simplicity
+#define ERR_MALFORMED 005
+#define ERR_RATE_LIMIT 006
+#define ERR_STORAGE 007
+
+typedef struct Client Client;
+
+typedef struct {
+    int active;
+    char name[MAX_NAME];
+    Client *members[MAX_ROOM_MEMBERS];
     int member_count;
-    struct Room *next;
 } Room;
 
-// Global lists and mutexes for thread safety
-Client *clients_head = NULL;
-Room *rooms_head = NULL;
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t rooms_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+struct Client {
+    int active;
+    int registered;
+    int fd;
+    char username[MAX_NAME];
+    pthread_t thread;
+    pthread_mutex_t send_mu;
+    char rxbuf[RXBUF_SIZE];
+    size_t rx_used;
+};
 
-// ---------- UTILITY FUNCTIONS ----------
+static Client clients[MAX_CLIENTS];
+static Room rooms[MAX_ROOMS];
+static pthread_mutex_t state_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
 
-// Log events to the personalised log file
-void log_event(const char *format, ...) {
-    pthread_mutex_lock(&log_mutex);
+// ---------- UTILITIES ----------
+static void log_event(const char *fmt, ...) {
+    pthread_mutex_lock(&log_mu);
     FILE *fp = fopen(LOG_FILE, "a");
     if (fp) {
+        char ts[64];
         time_t now = time(NULL);
-        char *time_str = ctime(&now);
-        time_str[strlen(time_str) - 1] = '\0'; // Remove newline
-        fprintf(fp, "[%s] ", time_str);
-        
-        va_list args;
-        va_start(args, format);
-        vfprintf(fp, format, args);
-        va_end(args);
-        
-        fprintf(fp, "\n");
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+        fprintf(fp, "[%s] ", ts);
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(fp, fmt, ap);
+        va_end(ap);
+        fputc('\n', fp);
         fclose(fp);
     }
-    pthread_mutex_unlock(&log_mutex);
+    pthread_mutex_unlock(&log_mu);
 }
 
-// Send a formatted response with the NID tag
-void send_response(int sockfd, const char *status, const char *msg) {
-    char buffer[BUFFER_SIZE];
-    snprintf(buffer, sizeof(buffer), "%s %s%s\n", status, msg, NID_TAG);
-    send(sockfd, buffer, strlen(buffer), 0);
+static int send_all_fd(int fd, const void *data, size_t len) {
+    const char *p = data;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
 }
 
-// Find a client by username
-Client* find_client_by_username(const char *username) {
-    Client *curr = clients_head;
-    while (curr) {
-        if (strcmp(curr->username, username) == 0) return curr;
-        curr = curr->next;
+static int send_client_line(Client *c, const char *line, int add_nid) {
+    char out[MAX_LINE + 64];
+    if (add_nid) {
+        int n = snprintf(out, sizeof(out), "%s %s\n", line, NID_TAG);
+        if (n < 0 || (size_t)n >= sizeof(out)) return -1;
+        pthread_mutex_lock(&c->send_mu);
+        int rc = send_all_fd(c->fd, out, (size_t)n);
+        pthread_mutex_unlock(&c->send_mu);
+        return rc;
+    }
+    int n = snprintf(out, sizeof(out), "%s\n", line);
+    if (n < 0 || (size_t)n >= sizeof(out)) return -1;
+    pthread_mutex_lock(&c->send_mu);
+    int rc = send_all_fd(c->fd, out, (size_t)n);
+    pthread_mutex_unlock(&c->send_mu);
+    return rc;
+}
+
+static void reply_ok(Client *c, const char *text) {
+    char line[MAX_LINE];
+    snprintf(line, sizeof(line), "OK %s", text);
+    send_client_line(c, line, 1);
+}
+
+static void reply_err(Client *c, int code, const char *reason) {
+    char line[MAX_LINE];
+    snprintf(line, sizeof(line), "ERR %03d %s", code, reason);
+    send_client_line(c, line, 1);
+}
+
+static int recv_line(Client *c, char *line, size_t cap) {
+    for (;;) {
+        for (size_t i = 0; i < c->rx_used; ++i) {
+            if (c->rxbuf[i] == '\n') {
+                size_t len = i;
+                if (len > 0 && c->rxbuf[len - 1] == '\r') len--;
+                if (len >= cap) return -2;
+                memcpy(line, c->rxbuf, len);
+                line[len] = '\0';
+                size_t remain = c->rx_used - (i + 1);
+                memmove(c->rxbuf, c->rxbuf + i + 1, remain);
+                c->rx_used = remain;
+                return 1;
+            }
+        }
+        if (c->rx_used == sizeof(c->rxbuf)) return -2;
+        ssize_t n = recv(c->fd, c->rxbuf + c->rx_used, sizeof(c->rxbuf) - c->rx_used, 0);
+        if (n == 0) return 0;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        c->rx_used += (size_t)n;
+    }
+}
+
+static int recv_exact(Client *c, void *buffer, size_t len) {
+    char *out = buffer;
+    while (len > 0) {
+        if (c->rx_used > 0) {
+            size_t take = c->rx_used < len ? c->rx_used : len;
+            memcpy(out, c->rxbuf, take);
+            memmove(c->rxbuf, c->rxbuf + take, c->rx_used - take);
+            c->rx_used -= take;
+            out += take;
+            len -= take;
+            continue;
+        }
+        ssize_t n = recv(c->fd, out, len, 0);
+        if (n == 0) return -1;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        out += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int valid_name(const char *s, size_t max_len) {
+    size_t n = strlen(s);
+    if (n == 0 || n >= max_len) return 0;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char ch = (unsigned char)s[i];
+        if (!(isalnum(ch) || ch == '_' || ch == '-')) return 0;
+    }
+    return 1;
+}
+
+static int valid_filename(const char *s) {
+    size_t n = strlen(s);
+    if (n == 0 || n >= MAX_FILENAME) return 0;
+    if (strcmp(s, ".") == 0 || strcmp(s, "..") == 0) return 0;
+    if (strchr(s, '/') || strchr(s, '\\')) return 0;
+    return 1;
+}
+
+static Client *find_client_locked(const char *username) {
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        if (clients[i].active && clients[i].registered &&
+            strcmp(clients[i].username, username) == 0) {
+            return &clients[i];
+        }
     }
     return NULL;
 }
 
-// Find a client by socket fd
-Client* find_client_by_sockfd(int sockfd) {
-    Client *curr = clients_head;
-    while (curr) {
-        if (curr->sockfd == sockfd) return curr;
-        curr = curr->next;
+static Room *find_room_locked(const char *room_name) {
+    for (int i = 0; i < MAX_ROOMS; ++i) {
+        if (rooms[i].active && strcmp(rooms[i].name, room_name) == 0) {
+            return &rooms[i];
+        }
     }
     return NULL;
 }
 
-// Find or create a room
-Room* find_room(const char *roomname) {
-    Room *curr = rooms_head;
-    while (curr) {
-        if (strcmp(curr->name, roomname) == 0) return curr;
-        curr = curr->next;
+static Room *create_room_locked(const char *room_name) {
+    Room *r = find_room_locked(room_name);
+    if (r) return r;
+    for (int i = 0; i < MAX_ROOMS; ++i) {
+        if (!rooms[i].active) {
+            rooms[i].active = 1;
+            rooms[i].member_count = 0;
+            snprintf(rooms[i].name, sizeof(rooms[i].name), "%s", room_name);
+            return &rooms[i];
+        }
     }
-    // Create new room
-    Room *new_room = (Room *)malloc(sizeof(Room));
-    strncpy(new_room->name, roomname, MAX_ROOMNAME - 1);
-    new_room->member_count = 0;
-    new_room->next = rooms_head;
-    rooms_head = new_room;
-    return new_room;
+    return NULL;
 }
 
-// Remove a client from all rooms (used on disconnect)
-void remove_client_from_rooms(const char *username) {
-    pthread_mutex_lock(&rooms_mutex);
-    Room *curr = rooms_head;
-    while (curr) {
-        for (int i = 0; i < curr->member_count; i++) {
-            if (strcmp(curr->members[i], username) == 0) {
-                // Shift remaining members
-                for (int j = i; j < curr->member_count - 1; j++) {
-                    strcpy(curr->members[j], curr->members[j+1]);
-                }
-                curr->member_count--;
-                break;
-            }
-        }
-        curr = curr->next;
-    }
-    pthread_mutex_unlock(&rooms_mutex);
+static int room_has_member(const Room *r, const Client *c) {
+    for (int i = 0; i < r->member_count; ++i)
+        if (r->members[i] == c) return 1;
+    return 0;
 }
 
-// Remove a client from the global list and free memory
-void remove_client(int sockfd) {
-    pthread_mutex_lock(&clients_mutex);
-    Client *curr = clients_head;
-    Client *prev = NULL;
-    while (curr) {
-        if (curr->sockfd == sockfd) {
-            if (prev) prev->next = curr->next;
-            else clients_head = curr->next;
-            
-            if (curr->is_registered) {
-                remove_client_from_rooms(curr->username);
-                log_event("DISCONNECT: User '%s' disconnected.", curr->username);
-            }
-            free(curr);
-            break;
+static int room_add_locked(Room *r, Client *c) {
+    if (room_has_member(r, c)) return 0;
+    if (r->member_count >= MAX_ROOM_MEMBERS) return -1;
+    r->members[r->member_count++] = c;
+    return 0;
+}
+
+static int room_remove_locked(Room *r, Client *c) {
+    for (int i = 0; i < r->member_count; ++i) {
+        if (r->members[i] == c) {
+            r->members[i] = r->members[r->member_count - 1];
+            r->member_count--;
+            return 0;
         }
-        prev = curr;
-        curr = curr->next;
     }
-    pthread_mutex_unlock(&clients_mutex);
+    return -1;
+}
+
+static void broadcast_presence(Client *exclude, const char *username, const char *event) {
+    Client *targets[MAX_CLIENTS];
+    int count = 0;
+    pthread_mutex_lock(&state_mu);
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        if (clients[i].active && clients[i].registered && &clients[i] != exclude)
+            targets[count++] = &clients[i];
+    }
+    pthread_mutex_unlock(&state_mu);
+
+    char msg[MAX_LINE];
+    snprintf(msg, sizeof(msg), "MSG PRESENCE %s %s", username, event);
+    for (int i = 0; i < count; ++i)
+        send_client_line(targets[i], msg, 0);
+}
+
+static int mkdir_if_missing(const char *path) {
+    if (mkdir(path, 0755) == 0) return 0;
+    if (errno == EEXIST) return 0;
+    return -1;
+}
+
+static int make_user_storage(const char *username, char *out, size_t out_sz) {
+    if (mkdir_if_missing("storage") < 0) return -1;
+    if (mkdir_if_missing(STORAGE_ROOT) < 0) return -1;
+    int n = snprintf(out, out_sz, "%s/%s", STORAGE_ROOT, username);
+    if (n < 0 || (size_t)n >= out_sz) return -1;
+    if (mkdir_if_missing(out) < 0) return -1;
+    return 0;
 }
 
 // ---------- COMMAND HANDLERS ----------
+static void send_users(Client *c) {
+    char line[MAX_LINE];
+    strcpy(line, "USERS");
+    pthread_mutex_lock(&state_mu);
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        if (!clients[i].active || !clients[i].registered) continue;
+        size_t used = strlen(line);
+        snprintf(line + used, sizeof(line) - used, "%s%s",
+                 (used == 5 ? " " : ","), clients[i].username);
+    }
+    pthread_mutex_unlock(&state_mu);
+    send_client_line(c, line, 1);
+}
 
-void handle_register(int sockfd, const char *username) {
-    if (strlen(username) == 0) {
-        send_response(sockfd, "ERR", "001 INVALID_USERNAME");
+static void send_rooms(Client *c) {
+    char line[MAX_LINE];
+    strcpy(line, "ROOMS");
+    pthread_mutex_lock(&state_mu);
+    for (int i = 0; i < MAX_ROOMS; ++i) {
+        if (!rooms[i].active) continue;
+        size_t used = strlen(line);
+        snprintf(line + used, sizeof(line) - used, "%s%s",
+                 (used == 5 ? " " : ","), rooms[i].name);
+    }
+    pthread_mutex_unlock(&state_mu);
+    send_client_line(c, line, 1);
+}
+
+static void broadcast_text(Client *sender, const char *message) {
+    Client *targets[MAX_CLIENTS];
+    int count = 0;
+    pthread_mutex_lock(&state_mu);
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        if (clients[i].active && clients[i].registered && &clients[i] != sender)
+            targets[count++] = &clients[i];
+    }
+    pthread_mutex_unlock(&state_mu);
+
+    char line[MAX_LINE];
+    snprintf(line, sizeof(line), "MSG BCAST %s %s", sender->username, message);
+    for (int i = 0; i < count; ++i)
+        send_client_line(targets[i], line, 0);
+}
+
+static void private_text(Client *sender, const char *target_name, const char *message) {
+    Client *target = NULL;
+    pthread_mutex_lock(&state_mu);
+    target = find_client_locked(target_name);
+    pthread_mutex_unlock(&state_mu);
+    if (!target) {
+        reply_err(sender, 2, "USER_NOT_FOUND");
         return;
     }
-    
-    pthread_mutex_lock(&clients_mutex);
-    if (find_client_by_username(username)) {
-        pthread_mutex_unlock(&clients_mutex);
-        send_response(sockfd, "ERR", "001 USERNAME_TAKEN");
+    char line[MAX_LINE];
+    snprintf(line, sizeof(line), "MSG PRIV %s %s", sender->username, message);
+    send_client_line(target, line, 0);
+    reply_ok(sender, "SENT");
+}
+
+static void room_text(Client *sender, const char *room_name, const char *message) {
+    Client *targets[MAX_ROOM_MEMBERS];
+    int count = 0;
+    Room *r = NULL;
+    pthread_mutex_lock(&state_mu);
+    r = find_room_locked(room_name);
+    if (r) {
+        for (int i = 0; i < r->member_count; ++i)
+            targets[count++] = r->members[i];
+    }
+    pthread_mutex_unlock(&state_mu);
+    if (!r) {
+        reply_err(sender, 3, "ROOM_NOT_FOUND");
         return;
     }
-    
-    Client *client = find_client_by_sockfd(sockfd);
-    if (client) {
-        strncpy(client->username, username, MAX_USERNAME - 1);
-        client->is_registered = 1;
-        send_response(sockfd, "OK", "REGISTERED");
-        log_event("REGISTER: User '%s' registered.", username);
-    }
-    pthread_mutex_unlock(&clients_mutex);
+    char line[MAX_LINE];
+    snprintf(line, sizeof(line), "MSG ROOM %s %s %s", room_name, sender->username, message);
+    for (int i = 0; i < count; ++i)
+        send_client_line(targets[i], line, 0);
+    reply_ok(sender, "SENT");
 }
 
-void handle_bcast(int sockfd, const char *message) {
-    Client *sender = find_client_by_sockfd(sockfd);
-    if (!sender || !sender->is_registered) return;
-    
-    char out_msg[BUFFER_SIZE];
-    snprintf(out_msg, sizeof(out_msg), "MSG BCAST %s %s\n", sender->username, message);
-    
-    pthread_mutex_lock(&clients_mutex);
-    Client *curr = clients_head;
-    while (curr) {
-        if (curr->sockfd != sockfd && curr->is_registered) {
-            send(curr->sockfd, out_msg, strlen(out_msg), 0);
-        }
-        curr = curr->next;
+static int send_file_to(Client *target, const char *sender_name,
+                        const char *filename, unsigned long long filesize,
+                        const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    char header[MAX_LINE];
+    int n = snprintf(header, sizeof(header), "MSG FILE %s %s %llu\n",
+                     sender_name, filename, filesize);
+    if (n < 0 || (size_t)n >= sizeof(header)) {
+        fclose(fp); return -1;
     }
-    pthread_mutex_unlock(&clients_mutex);
-    
-    send_response(sockfd, "OK", "SENT");
-    log_event("BCAST: %s -> '%s'", sender->username, message);
+
+    pthread_mutex_lock(&target->send_mu);
+    int rc = send_all_fd(target->fd, header, (size_t)n);
+    unsigned char buf[8192];
+    unsigned long long remaining = filesize;
+    while (rc == 0 && remaining > 0) {
+        size_t want = remaining > sizeof(buf) ? sizeof(buf) : (size_t)remaining;
+        size_t got = fread(buf, 1, want, fp);
+        if (got == 0) { rc = -1; break; }
+        if (send_all_fd(target->fd, buf, got) < 0) { rc = -1; break; }
+        remaining -= got;
+    }
+    pthread_mutex_unlock(&target->send_mu);
+    fclose(fp);
+    return rc;
 }
 
-void handle_pmsg(int sockfd, const char *target, const char *message) {
-    Client *sender = find_client_by_sockfd(sockfd);
-    if (!sender || !sender->is_registered) return;
-    
-    pthread_mutex_lock(&clients_mutex);
-    Client *target_client = find_client_by_username(target);
-    if (!target_client) {
-        pthread_mutex_unlock(&clients_mutex);
-        send_response(sockfd, "ERR", "002 USER_NOT_FOUND");
+static void handle_sendfile(Client *sender, const char *args) {
+    char target[MAX_NAME];
+    char filename[MAX_FILENAME];
+    unsigned long long filesize;
+    if (sscanf(args, "%31s %255s %llu", target, filename, &filesize) != 3 ||
+        !valid_name(target, MAX_NAME) || !valid_filename(filename)) {
+        reply_err(sender, ERR_MALFORMED, "MALFORMED_SENDFILE");
         return;
     }
-    
-    char out_msg[BUFFER_SIZE];
-    snprintf(out_msg, sizeof(out_msg), "MSG PRIV %s %s\n", sender->username, message);
-    send(target_client->sockfd, out_msg, strlen(out_msg), 0);
-    pthread_mutex_unlock(&clients_mutex);
-    
-    send_response(sockfd, "OK", "SENT");
-    log_event("PMSG: %s -> %s: '%s'", sender->username, target, message);
-}
 
-void handle_join(int sockfd, const char *roomname) {
-    Client *client = find_client_by_sockfd(sockfd);
-    if (!client || !client->is_registered) return;
-    
-    pthread_mutex_lock(&rooms_mutex);
-    Room *room = find_room(roomname);
-    if (room->member_count >= 10) {
-        pthread_mutex_unlock(&rooms_mutex);
-        send_response(sockfd, "ERR", "005 ROOM_FULL");
+    if (filesize > MAX_FILE_SIZE) {
+        reply_err(sender, 4, "FILE_TOO_LARGE");
         return;
     }
-    
-    // Check if already in room
-    for (int i = 0; i < room->member_count; i++) {
-        if (strcmp(room->members[i], client->username) == 0) {
-            pthread_mutex_unlock(&rooms_mutex);
-            send_response(sockfd, "OK", "JOINED"); // Already in room
-            return;
-        }
-    }
-    
-    strcpy(room->members[room->member_count++], client->username);
-    pthread_mutex_unlock(&rooms_mutex);
-    
-    send_response(sockfd, "OK", "JOINED");
-    log_event("JOIN: %s joined room '%s'", client->username, roomname);
-}
 
-void handle_leave(int sockfd, const char *roomname) {
-    Client *client = find_client_by_sockfd(sockfd);
-    if (!client || !client->is_registered) return;
-    
-    pthread_mutex_lock(&rooms_mutex);
-    Room *room = find_room(roomname);
-    int found = 0;
-    for (int i = 0; i < room->member_count; i++) {
-        if (strcmp(room->members[i], client->username) == 0) {
-            for (int j = i; j < room->member_count - 1; j++) {
-                strcpy(room->members[j], room->members[j+1]);
-            }
-            room->member_count--;
-            found = 1;
-            break;
-        }
+    // Check if target exists (user or room)
+    Client *client_target = NULL;
+    Room *room_target = NULL;
+    pthread_mutex_lock(&state_mu);
+    client_target = find_client_locked(target);
+    if (!client_target) {
+        room_target = find_room_locked(target);
     }
-    pthread_mutex_unlock(&rooms_mutex);
-    
-    if (found) {
-        send_response(sockfd, "OK", "LEFT");
-        log_event("LEAVE: %s left room '%s'", client->username, roomname);
-    } else {
-        send_response(sockfd, "ERR", "003 ROOM_NOT_FOUND");
-    }
-}
+    pthread_mutex_unlock(&state_mu);
 
-void handle_rooms(int sockfd) {
-    char room_list[BUFFER_SIZE] = "";
-    pthread_mutex_lock(&rooms_mutex);
-    Room *curr = rooms_head;
-    while (curr) {
-        if (curr->member_count > 0) {
-            strcat(room_list, curr->name);
-            strcat(room_list, ",");
+    if (!client_target && !room_target) {
+        // Drain file bytes to keep connection synced
+        unsigned char buf[8192];
+        unsigned long long left = filesize;
+        while (left > 0) {
+            size_t take = left > sizeof(buf) ? sizeof(buf) : (size_t)left;
+            if (recv_exact(sender, buf, take) < 0) return;
+            left -= take;
         }
-        curr = curr->next;
-    }
-    pthread_mutex_unlock(&rooms_mutex);
-    
-    if (strlen(room_list) > 0) room_list[strlen(room_list)-1] = '\0'; // Remove trailing comma
-    send_response(sockfd, "OK", room_list);
-}
-
-void handle_rmsg(int sockfd, const char *roomname, const char *message) {
-    Client *sender = find_client_by_sockfd(sockfd);
-    if (!sender || !sender->is_registered) return;
-    
-    pthread_mutex_lock(&rooms_mutex);
-    Room *room = find_room(roomname);
-    if (room->member_count == 0) {
-        pthread_mutex_unlock(&rooms_mutex);
-        send_response(sockfd, "ERR", "003 ROOM_NOT_FOUND");
+        reply_err(sender, 2, "USER_NOT_FOUND");
         return;
     }
-    
-    char out_msg[BUFFER_SIZE];
-    snprintf(out_msg, sizeof(out_msg), "MSG ROOM %s %s %s\n", roomname, sender->username, message);
-    
-    for (int i = 0; i < room->member_count; i++) {
-        Client *target = find_client_by_username(room->members[i]);
-        if (target && target->sockfd != sockfd) {
-            send(target->sockfd, out_msg, strlen(out_msg), 0);
-        }
-    }
-    pthread_mutex_unlock(&rooms_mutex);
-    
-    send_response(sockfd, "OK", "SENT");
-    log_event("RMSG: %s to room '%s': '%s'", sender->username, roomname, message);
-}
 
-void handle_sendfile(int sockfd, const char *target, const char *filename, int filesize) {
-    Client *sender = find_client_by_sockfd(sockfd);
-    if (!sender || !sender->is_registered) return;
-    
-    // 1. Create user's storage directory if it doesn't exist
-    char dir_path[256];
-    snprintf(dir_path, sizeof(dir_path), "%s%s/", STORAGE_BASE, sender->username);
-    mkdir(STORAGE_BASE, 0777);
-    mkdir(dir_path, 0777);
-    
-    // 2. Save file to disk
-    char filepath[256];
-    snprintf(filepath, sizeof(filepath), "%s%s", dir_path, filename);
-    FILE *fp = fopen(filepath, "wb");
+    char user_dir[512];
+    if (make_user_storage(sender->username, user_dir, sizeof(user_dir)) < 0) {
+        unsigned char buf[8192];
+        unsigned long long left = filesize;
+        while (left > 0) {
+            size_t take = left > sizeof(buf) ? sizeof(buf) : (size_t)left;
+            if (recv_exact(sender, buf, take) < 0) return;
+            left -= take;
+        }
+        reply_err(sender, ERR_STORAGE, "STORAGE_ERROR");
+        return;
+    }
+
+    char path[768];
+    int pn = snprintf(path, sizeof(path), "%s/%s", user_dir, filename);
+    if (pn < 0 || (size_t)pn >= sizeof(path)) {
+        reply_err(sender, ERR_STORAGE, "STORAGE_ERROR");
+        return;
+    }
+
+    FILE *fp = fopen(path, "wb");
     if (!fp) {
-        send_response(sockfd, "ERR", "006 FILE_WRITE_ERROR");
+        reply_err(sender, ERR_STORAGE, "STORAGE_ERROR");
         return;
     }
-    
-    char buffer[BUFFER_SIZE];
-    int remaining = filesize;
-    while (remaining > 0) {
-        int to_read = (remaining < BUFFER_SIZE) ? remaining : BUFFER_SIZE;
-        int bytes_read = recv(sockfd, buffer, to_read, 0);
-        if (bytes_read <= 0) break; // Connection lost
-        fwrite(buffer, 1, bytes_read, fp);
-        remaining -= bytes_read;
+
+    unsigned char buf[8192];
+    unsigned long long left = filesize;
+    int write_ok = 1;
+    while (left > 0) {
+        size_t take = left > sizeof(buf) ? sizeof(buf) : (size_t)left;
+        if (recv_exact(sender, buf, take) < 0) {
+            fclose(fp); unlink(path); return;
+        }
+        if (write_ok && fwrite(buf, 1, take, fp) != take)
+            write_ok = 0;
+        left -= take;
     }
     fclose(fp);
-    
-    // 3. Deliver the file to the target (if it's a user)
-    Client *target_client = find_client_by_username(target);
-    if (target_client) {
-        char out_msg[BUFFER_SIZE];
-        snprintf(out_msg, sizeof(out_msg), "MSG FILE %s %s %d\n", sender->username, filename, filesize);
-        send(target_client->sockfd, out_msg, strlen(out_msg), 0);
+
+    if (!write_ok) {
+        unlink(path);
+        reply_err(sender, ERR_STORAGE, "STORAGE_ERROR");
+        return;
     }
-    
-    send_response(sockfd, "OK", "FILE_RECEIVED"); 
-    log_event("SENDFILE: %s sent '%s' (%d bytes) to %s", sender->username, filename, filesize, target);
+
+    // Required response: OK FILE_RECEIVED <filename> NID:6956
+    char response[MAX_LINE];
+    snprintf(response, sizeof(response), "OK FILE_RECEIVED %s", filename);
+    send_client_line(sender, response, 1);
+
+    // Deliver to user or room
+    if (client_target) {
+        send_file_to(client_target, sender->username, filename, filesize, path);
+    } else if (room_target) {
+        Client *targets[MAX_ROOM_MEMBERS];
+        int count = 0;
+        pthread_mutex_lock(&state_mu);
+        for (int i = 0; i < room_target->member_count; ++i)
+            targets[count++] = room_target->members[i];
+        pthread_mutex_unlock(&state_mu);
+        for (int i = 0; i < count; ++i)
+            send_file_to(targets[i], sender->username, filename, filesize, path);
+    }
+
+    log_event("SENDFILE: %s -> %s: '%s' (%llu bytes)", sender->username, target, filename, filesize);
 }
 
-// ---------- MAIN CLIENT HANDLER THREAD ----------
-void *handle_client(void *arg) {
-    int sockfd = *(int *)arg;
-    free(arg);
-    
-    // Register client in global list
-    pthread_mutex_lock(&clients_mutex);
-    Client *new_client = (Client *)malloc(sizeof(Client));
-    new_client->sockfd = sockfd;
-    new_client->is_registered = 0;
-    new_client->next = clients_head;
-    clients_head = new_client;
-    pthread_mutex_unlock(&clients_mutex);
-    
-    log_event("CONNECT: New connection on socket %d", sockfd);
-    
-    char buffer[BUFFER_SIZE];
-    char line_buffer[BUFFER_SIZE];
-    int line_len = 0;
-    
-    while (1) {
-        int bytes_read = recv(sockfd, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_read <= 0) break; // Disconnect or error
-        
-        buffer[bytes_read] = '\0';
-        
-        // Process byte by byte to handle partial lines and multiple commands
-        for (int i = 0; i < bytes_read; i++) {
-            if (buffer[i] == '\n') {
-                line_buffer[line_len] = '\0';
-                
-                // Parse command (FIXED: arg3 declared, sscanf updated)
-                char command[20], arg1[256], arg2[BUFFER_SIZE], arg3[256];
-                int args = sscanf(line_buffer, "%s %s %s %s", command, arg1, arg2, arg3);
-                
-                if (strcmp(command, "REGISTER") == 0 && args >= 2) {
-                    handle_register(sockfd, arg1);
-                } 
-                else if (strcmp(command, "BCAST") == 0 && args >= 2) {
-                    handle_bcast(sockfd, arg1); 
-                }
-                else if (strcmp(command, "PMSG") == 0 && args >= 3) {
-                    handle_pmsg(sockfd, arg1, arg2);
-                }
-                else if (strcmp(command, "JOIN") == 0 && args >= 2) {
-                    handle_join(sockfd, arg1);
-                }
-                else if (strcmp(command, "LEAVE") == 0 && args >= 2) {
-                    handle_leave(sockfd, arg1);
-                }
-                else if (strcmp(command, "ROOMS") == 0) {
-                    handle_rooms(sockfd);
-                }
-                else if (strcmp(command, "RMSG") == 0 && args >= 3) {
-                    handle_rmsg(sockfd, arg1, arg2);
-                }
-                else if (strcmp(command, "SENDFILE") == 0 && args >= 4) {
-                    int filesize = atoi(arg3);
-                    handle_sendfile(sockfd, arg1, arg2, filesize);
-                }
-                else if (strcmp(command, "QUIT") == 0) {
-                    send_response(sockfd, "OK", "BYE");
-                    goto cleanup;
-                }
-                else {
-                    send_response(sockfd, "ERR", "007 UNKNOWN_COMMAND");
-                }
-                
-                line_len = 0; // Reset for next line
-            } else {
-                line_buffer[line_len++] = buffer[i];
-                if (line_len >= BUFFER_SIZE - 1) line_len = 0; // Prevent overflow
+static int register_client(Client *c, const char *username) {
+    if (!valid_name(username, MAX_NAME)) return -1;
+    pthread_mutex_lock(&state_mu);
+    if (find_client_locked(username) != NULL) {
+        pthread_mutex_unlock(&state_mu);
+        return 1;
+    }
+    c->registered = 1;
+    snprintf(c->username, sizeof(c->username), "%s", username);
+    pthread_mutex_unlock(&state_mu);
+    return 0;
+}
+
+static void cleanup_client(Client *c) {
+    char left_name[MAX_NAME];
+    int had_registration = 0;
+
+    pthread_mutex_lock(&state_mu);
+    if (c->registered) {
+        had_registration = 1;
+        snprintf(left_name, sizeof(left_name), "%s", c->username);
+        for (int i = 0; i < MAX_ROOMS; ++i) {
+            if (!rooms[i].active) continue;
+            room_remove_locked(&rooms[i], c);
+        }
+    }
+    pthread_mutex_unlock(&state_mu);
+
+    if (had_registration) {
+        log_event("DISCONNECT: User '%s' disconnected.", left_name);
+        broadcast_presence(c, left_name, "LEFT");
+    }
+
+    close(c->fd);
+    pthread_mutex_lock(&state_mu);
+    c->active = 0;
+    c->registered = 0;
+    c->fd = -1;
+    c->username[0] = '\0';
+    c->rx_used = 0;
+    pthread_mutex_unlock(&state_mu);
+}
+
+static void *client_thread(void *arg) {
+    Client *c = arg;
+    char line[MAX_LINE];
+
+    int rc = recv_line(c, line, sizeof(line));
+    if (rc <= 0) { cleanup_client(c); return NULL; }
+
+    char username[MAX_NAME];
+    if (sscanf(line, "REGISTER %31s", username) != 1) {
+        reply_err(c, ERR_MALFORMED, "REGISTER_REQUIRED");
+        cleanup_client(c);
+        return NULL;
+    }
+
+    int reg_rc = register_client(c, username);
+    if (reg_rc == 1) {
+        reply_err(c, 1, "USERNAME_TAKEN");
+        cleanup_client(c);
+        return NULL;
+    }
+    if (reg_rc < 0) {
+        reply_err(c, ERR_MALFORMED, "INVALID_USERNAME");
+        cleanup_client(c);
+        return NULL;
+    }
+
+    // Personalised REGISTER response
+    char regmsg[MAX_LINE];
+    snprintf(regmsg, sizeof(regmsg), "OK REGISTERED %s", c->username);
+    send_client_line(c, regmsg, 1);
+    log_event("REGISTER: User '%s' registered.", c->username);
+    broadcast_presence(NULL, c->username, "JOINED");
+
+    for (;;) {
+        rc = recv_line(c, line, sizeof(line));
+        if (rc == 0) break;
+        if (rc < 0) {
+            reply_err(c, ERR_MALFORMED, "FRAMING_ERROR");
+            break;
+        }
+        if (rc == -2) {
+            reply_err(c, ERR_MALFORMED, "LINE_TOO_LONG");
+            break;
+        }
+        if (line[0] == '\0') continue; // Skip empty lines
+
+        if (strcmp(line, "LIST") == 0) {
+            send_users(c);
+        } else if (strncmp(line, "BCAST ", 6) == 0) {
+            const char *msg = line + 6;
+            if (*msg == '\0') { reply_err(c, ERR_MALFORMED, "EMPTY_MESSAGE"); continue; }
+            broadcast_text(c, msg);
+            reply_ok(c, "SENT");
+            log_event("BCAST: %s -> '%s'", c->username, msg);
+        } else if (strncmp(line, "PMSG ", 5) == 0) {
+            char target[MAX_NAME];
+            const char *rest = line + 5;
+            const char *sp = strchr(rest, ' ');
+            if (!sp) { reply_err(c, ERR_MALFORMED, "MALFORMED_PMSG"); continue; }
+            size_t n = (size_t)(sp - rest);
+            if (n >= sizeof(target)) { reply_err(c, ERR_MALFORMED, "MALFORMED_PMSG"); continue; }
+            memcpy(target, rest, n); target[n] = '\0';
+            const char *msg = sp + 1;
+            if (!valid_name(target, MAX_NAME) || *msg == '\0') {
+                reply_err(c, ERR_MALFORMED, "MALFORMED_PMSG"); continue;
             }
+            private_text(c, target, msg);
+            log_event("PMSG: %s -> %s: '%s'", c->username, target, msg);
+        } else if (strncmp(line, "JOIN ", 5) == 0) {
+            const char *room = line + 5;
+            if (!valid_name(room, MAX_NAME)) { reply_err(c, ERR_MALFORMED, "INVALID_ROOM"); continue; }
+            pthread_mutex_lock(&state_mu);
+            Room *r = create_room_locked(room);
+            int ok = r ? room_add_locked(r, c) : -1;
+            pthread_mutex_unlock(&state_mu);
+            if (ok < 0) reply_err(c, ERR_MALFORMED, "ROOM_FULL");
+            else {
+                char resp[MAX_LINE]; snprintf(resp, sizeof(resp), "OK JOINED %s", room); send_client_line(c, resp, 1);
+                log_event("JOIN: %s joined room '%s'", c->username, room);
+            }
+        } else if (strncmp(line, "LEAVE ", 6) == 0) {
+            const char *room = line + 6;
+            pthread_mutex_lock(&state_mu);
+            Room *r = find_room_locked(room);
+            int found = r != NULL;
+            if (r) room_remove_locked(r, c);
+            pthread_mutex_unlock(&state_mu);
+            if (!found) reply_err(c, 3, "ROOM_NOT_FOUND");
+            else {
+                char resp[MAX_LINE]; snprintf(resp, sizeof(resp), "OK LEFT %s", room); send_client_line(c, resp, 1);
+                log_event("LEAVE: %s left room '%s'", c->username, room);
+            }
+        } else if (strcmp(line, "ROOMS") == 0) {
+            send_rooms(c);
+        } else if (strncmp(line, "RMSG ", 5) == 0) {
+            char room[MAX_NAME];
+            const char *rest = line + 5;
+            const char *sp = strchr(rest, ' ');
+            if (!sp) { reply_err(c, ERR_MALFORMED, "MALFORMED_RMSG"); continue; }
+            size_t n = (size_t)(sp - rest);
+            if (n >= sizeof(room)) { reply_err(c, ERR_MALFORMED, "MALFORMED_RMSG"); continue; }
+            memcpy(room, rest, n); room[n] = '\0';
+            const char *msg = sp + 1;
+            if (!valid_name(room, MAX_NAME) || *msg == '\0') {
+                reply_err(c, ERR_MALFORMED, "MALFORMED_RMSG"); continue;
+            }
+            room_text(c, room, msg);
+            log_event("RMSG: %s to room '%s': '%s'", c->username, room, msg);
+        } else if (strncmp(line, "SENDFILE ", 9) == 0) {
+            handle_sendfile(c, line + 9);
+        } else if (strcmp(line, "QUIT") == 0) {
+            reply_ok(c, "BYE");
+            log_event("QUIT: %s", c->username);
+            break;
+        } else {
+            reply_err(c, ERR_MALFORMED, "UNKNOWN_COMMAND");
         }
     }
 
-cleanup:
-    remove_client(sockfd);
-    close(sockfd);
+    cleanup_client(c);
     return NULL;
 }
 
-// ---------- MAIN FUNCTION ----------
-int main() {
-    int server_fd, new_socket;
-    struct sockaddr_in address;
+int main(void) {
+    signal(SIGPIPE, SIG_IGN); // Prevent server crash if client disconnects unexpectedly
+
+    for (int i = 0; i < MAX_CLIENTS; ++i) {
+        clients[i].fd = -1;
+        pthread_mutex_init(&clients[i].send_mu, NULL);
+    }
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) { perror("socket"); return 1; }
+
     int opt = 1;
-    int addrlen = sizeof(address);
-
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        perror("setsockopt failed");
-        exit(EXIT_FAILURE);
-    }
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
-
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-    if (listen(server_fd, BACKLOG) < 0) {
-        perror("listen failed");
-        exit(EXIT_FAILURE);
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt"); close(server_fd); return 1;
     }
 
-    printf("NetMessenger Server started on port %d\n", PORT);
-    printf("Node ID: NID:6956\n");
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind"); close(server_fd); return 1;
+    }
+    if (listen(server_fd, 16) < 0) {
+        perror("listen"); close(server_fd); return 1;
+    }
+
+    if (mkdir_if_missing("storage") < 0 || mkdir_if_missing(STORAGE_ROOT) < 0) {
+        perror("storage"); close(server_fd); return 1;
+    }
+
     log_event("SERVER START: Port %d", PORT);
+    printf("NetMessenger Server started on port %d\n", PORT);
+    printf("Node ID: %s\n", NID_TAG);
+    printf("Storage root: %s\n", STORAGE_ROOT);
+    printf("Press Ctrl+C to stop.\n");
 
-    while (1) {
-        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
-            perror("accept failed");
+    for (;;) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept");
             continue;
         }
-        pthread_t thread_id;
-        int *client_sock = malloc(sizeof(int));
-        *client_sock = new_socket;
-        if (pthread_create(&thread_id, NULL, handle_client, (void *)client_sock) != 0) {
-            perror("pthread_create failed");
-            close(new_socket);
-            free(client_sock);
+
+        pthread_mutex_lock(&state_mu);
+        Client *slot = NULL;
+        for (int i = 0; i < MAX_CLIENTS; ++i) {
+            if (!clients[i].active) { slot = &clients[i]; break; }
         }
-        pthread_detach(thread_id);
+        if (slot) {
+            slot->active = 1;
+            slot->registered = 0;
+            slot->fd = client_fd;
+            slot->username[0] = '\0';
+            slot->rx_used = 0;
+        }
+        pthread_mutex_unlock(&state_mu);
+
+        if (!slot) {
+            const char *msg = "ERR 005 SERVER_FULL NID:6956\n";
+            send_all_fd(client_fd, msg, strlen(msg));
+            close(client_fd);
+            continue;
+        }
+
+        if (pthread_create(&slot->thread, NULL, client_thread, slot) != 0) {
+            close(client_fd);
+            pthread_mutex_lock(&state_mu);
+            slot->active = 0;
+            slot->fd = -1;
+            pthread_mutex_unlock(&state_mu);
+            continue;
+        }
+        pthread_detach(slot->thread);
     }
-    return 0;
 }
