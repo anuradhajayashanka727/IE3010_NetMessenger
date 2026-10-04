@@ -22,6 +22,7 @@
 #define REGNO "IT23695634"
 #define DOWNLOAD_DIR "./downloads_IT23695634"
 #define MAX_LINE 4096
+#define MAX_USERNAME 32
 #define MAX_FILENAME 256
 #define MAX_FILE_SIZE (10ULL * 1024ULL * 1024ULL)
 
@@ -55,22 +56,91 @@ static void mkdir_if_missing(const char *path) {
     }
 }
 
+// ---------- BUFFERED EXACT RECEIVE ----------
+// TCP is a byte stream. The same recv() may contain the MSG FILE header
+// and some of the file bytes. Those bytes remain in rxbuf, so the file
+// receiver must consume buffered bytes before reading from the socket again.
+static int recv_exact_buffered(char *rxbuf,
+                               size_t *rx_used,
+                               void *buffer,
+                               size_t len) {
+    unsigned char *out = (unsigned char *)buffer;
+
+    while (len > 0) {
+        // First consume bytes already buffered after the header.
+        if (*rx_used > 0) {
+            size_t take = (*rx_used < len) ? *rx_used : len;
+
+            memcpy(out, rxbuf, take);
+            memmove(rxbuf, rxbuf + take, *rx_used - take);
+
+            *rx_used -= take;
+            out += take;
+            len -= take;
+            continue;
+        }
+
+        // Nothing buffered: receive directly from the TCP socket.
+        ssize_t n = recv(sockfd, out, len, 0);
+
+        if (n == 0)
+            return -1;
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+
+        out += n;
+        len -= (size_t)n;
+    }
+
+    return 0;
+}
+
+static int discard_exact_buffered(char *rxbuf,
+                                  size_t *rx_used,
+                                  unsigned long long len) {
+    unsigned char temp[4096];
+
+    while (len > 0) {
+        size_t want = (len > sizeof(temp)) ? sizeof(temp) : (size_t)len;
+
+        if (recv_exact_buffered(rxbuf, rx_used, temp, want) < 0)
+            return -1;
+
+        len -= (unsigned long long)want;
+    }
+
+    return 0;
+}
+
 // ---------- FILE RECEIVE HANDLER ----------
 // Called from the receiver thread when "MSG FILE <sender> <filename> <size>" is seen.
-static void receive_file(const char *sender, const char *filename, unsigned long long filesize) {
+static void receive_file(const char *sender,
+                         const char *filename,
+                         unsigned long long filesize,
+                         char *rxbuf,
+                         size_t *rx_used) {
     // Validate filename
     if (strlen(filename) == 0 || strlen(filename) >= MAX_FILENAME ||
+        strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0 ||
         strchr(filename, '/') || strchr(filename, '\\')) {
         fprintf(stderr, "\n[!] Rejecting file with invalid name.\n");
-        // Drain the bytes anyway
-        char tmp[4096];
-        unsigned long long left = filesize;
-        while (left > 0) {
-            size_t want = left > sizeof(tmp) ? sizeof(tmp) : (size_t)left;
-            ssize_t r = recv(sockfd, tmp, want, 0);
-            if (r <= 0) { running = 0; return; }
-            left -= (unsigned long long)r;
-        }
+
+        if (discard_exact_buffered(rxbuf, rx_used, filesize) < 0)
+            running = 0;
+
+        return;
+    }
+
+    if (filesize > MAX_FILE_SIZE) {
+        fprintf(stderr, "\n[!] Rejecting file larger than 10 MB.\n");
+
+        if (discard_exact_buffered(rxbuf, rx_used, filesize) < 0)
+            running = 0;
+
         return;
     }
 
@@ -81,26 +151,38 @@ static void receive_file(const char *sender, const char *filename, unsigned long
     FILE *fp = fopen(path, "wb");
     if (!fp) {
         fprintf(stderr, "\n[!] Could not open %s for writing.\n", path);
-        char tmp[4096];
-        unsigned long long left = filesize;
-        while (left > 0) {
-            size_t want = left > sizeof(tmp) ? sizeof(tmp) : (size_t)left;
-            ssize_t r = recv(sockfd, tmp, want, 0);
-            if (r <= 0) { running = 0; return; }
-            left -= (unsigned long long)r;
-        }
+
+        if (discard_exact_buffered(rxbuf, rx_used, filesize) < 0)
+            running = 0;
+
         return;
     }
 
     unsigned char buf[4096];
     unsigned long long left = filesize;
+
     while (left > 0) {
         size_t want = left > sizeof(buf) ? sizeof(buf) : (size_t)left;
-        ssize_t r = recv(sockfd, buf, want, 0);
-        if (r <= 0) { running = 0; break; }
-        fwrite(buf, 1, (size_t)r, fp);
-        left -= (unsigned long long)r;
+
+        if (recv_exact_buffered(rxbuf, rx_used, buf, want) < 0) {
+            fprintf(stderr, "\n[!] File receive failed.\n");
+            fclose(fp);
+            remove(path);
+            running = 0;
+            return;
+        }
+
+        if (fwrite(buf, 1, want, fp) != want) {
+            fprintf(stderr, "\n[!] File write error.\n");
+            fclose(fp);
+            remove(path);
+            running = 0;
+            return;
+        }
+
+        left -= (unsigned long long)want;
     }
+
     fclose(fp);
     printf("\n[+] File received from %s: %s (%llu bytes) -> %s\n> ",
            sender, filename, filesize, path);
@@ -138,7 +220,11 @@ static void *receiver_thread(void *arg) {
                 char sender[64], filename[MAX_FILENAME];
                 unsigned long long filesize;
                 if (sscanf(line + 9, "%63s %255s %llu", sender, filename, &filesize) == 3) {
-                    receive_file(sender, filename, filesize);
+                    receive_file(sender,
+                                 filename,
+                                 filesize,
+                                 rxbuf,
+                                 &rx_used);
                 }
                 continue;
             }
@@ -228,11 +314,22 @@ static int handle_local_command(char *line) {
             printf("[!] Usage: /register <username>\n");
             return 1;
         }
+
+        if (strlen(user) >= MAX_USERNAME) {
+            printf("[!] Username too long. Maximum is %d characters.\n",
+                   MAX_USERNAME - 1);
+            return 1;
+        }
+
         char cmd[MAX_LINE];
         snprintf(cmd, sizeof(cmd), "REGISTER %s\n", user);
-        send_line(cmd);
-        // Save for later (strip newline)
-        strncpy(my_username, user, sizeof(my_username) - 1);
+
+        if (send_line(cmd) < 0) {
+            printf("[!] Failed to send REGISTER command.\n");
+            return 1;
+        }
+
+        memcpy(my_username, user, strlen(user) + 1);
         return 1;
     }
 
