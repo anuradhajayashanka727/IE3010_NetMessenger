@@ -1,0 +1,66 @@
+[Sun Oct  4 04:57:02 2026] SERVER START: Port 11634
+[Sun Oct  4 04:57:26 2026] CONNECT: New connection on socket 4
+[Sun Oct  4 05:01:14 2026] REGISTER: User 'anuradha' registered.
+[Sun Oct  4 05:01:44 2026] BCAST: anuradha -> 'Hello'
+[Sun Oct  4 05:02:07 2026] DISCONNECT: User 'anuradha' disconnected.
+[2026-10-04 05:11:22] SERVER START: Port 11634
+[2026-10-04 05:14:52] REGISTER: User 'anuradha' registered.
+[2026-10-04 05:15:09] REGISTER: User 'bob' registered.
+[2026-10-04 05:15:20] BCAST: anuradha -> 'Hello everyone, this is a multi-word message!'
+[2026-10-04 05:15:49] PMSG: anuradha -> bob: 'Hi Bob, how are you?'
+[2026-10-04 05:16:27] JOIN: anuradha joined room 'dev'
+[2026-10-04 05:16:39] JOIN: bob joined room 'dev'
+[2026-10-04 05:16:51] RMSG: anuradha to room 'dev': 'Hello team!'
+[2026-10-04 05:20:12] SERVER START: Port 11634
+[2026-10-04 05:20:29] REGISTER: User 'anuradha' registered.
+[2026-10-04 05:20:29] DISCONNECT: User 'anuradha' disconnected.
+[2026-10-04 05:25:25] REGISTER: User 'bob' registered.
+[2026-10-04 05:26:39] DISCONNECT: User 'bob' disconnected.
+[2026-10-04 05:26:45] REGISTER: User 'bob' registered.
+[2026-10-04 05:26:57] REGISTER: User 'anuradha' registered.
+[2026-10-04 05:26:57] SENDFILE: anuradha -> bob: 'test.txt' (52 bytes)
+[2026-10-04 05:26:57] DISCONNECT: User 'anuradha' disconnected.
+[2026-10-04 05:36:36] SERVER START: Port 11634
+[2026-10-04 05:37:28] REGISTER: User 'anuradha' registered.
+[2026-10-04 05:38:20] REGISTER: User 'bob' registered.
+[2026-10-04 06:20:24] PMSG: anuradha -> bob: 'Hi Bob, how are you?'
+[2026-10-04 06:20:52] JOIN: anuradha joined room 'dev'
+[2026-10-04 06:20:54] RMSG: anuradha to room 'dev': 'Hello room!'
+[2026-10-04 06:20:58] JOIN: bob joined room 'dev'
+[2026-10-04 06:20:59] RMSG: bob to room 'dev': 'Hello room!'
+[2026-10-04 06:22:46] SENDFILE: anuradha -> bob: 'test.txt' (52 bytes)
+[2026-10-04 07:29:42] SERVER START: Port 11634
+[2026-10-04 07:32:12] REGISTER: User 'anuradha' registered.
+[2026-10-04 07:32:41] REGISTER: User 'bob' registered.
+[2026-10-04 07:34:45] BCAST: anuradha -> 'Hello everyone, this is my first broadcast!'
+[2026-10-04 07:35:15] PMSG: bob -> anuradha: 'Hi Anuradha! This is Bob.'
+[2026-10-04 07:36:40] JOIN: anuradha joined room 'dev'
+[2026-10-04 07:37:02] JOIN: bob joined room 'dev'
+[2026-10-04 07:37:31] RMSG: anuradha to room 'dev': 'Hello dev team!'
+[2026-10-04 07:38:59] LEAVE: bob left room 'dev'
+[2026-10-04 07:39:28] RMSG: anuradha to room 'dev': 'Can bob still see this?'
+[2026-10-04 07:41:19] SENDFILE: anuradha -> bob: 'myfile.txt' (39 bytes)
+[2026-10-04 07:42:45] JOIN: anuradha joined room 'testroom'
+[2026-10-04 07:42:48] JOIN: bob joined room 'testroom'
+[2026-10-04 07:43:36] SENDFILE: anuradha -> testroom: 'roomfile.txt' (23 bytes)
+[2026-10-04 07:44:48] PMSG: anuradha -> nonexistentuser: 'Hello'
+[2026-10-04 07:44:59] RMSG: anuradha to room 'fakeroom': 'Hello'
+[2026-10-04 07:46:33] QUIT: bob
+[2026-10-04 07:46:33] DISCONNECT: User 'bob' disconnected.
+[2026-10-04 08:02:13] SERVER START: Port 11634
+[2026-10-04 08:03:13] REGISTER: User 'alice' registered.
+[2026-10-04 08:03:46] REGISTER: User 'bob' registered.
+[2026-10-04 08:04:15] REGISTER: User 'dave' registered.
+[2026-10-04 08:04:44] REGISTER: User 'erin' registered.
+[2026-10-04 08:09:16] BCAST: alice -> 'Hello everyone'
+[2026-10-04 08:10:31] PMSG: alice -> bob: 'This is a private message'
+[2026-10-04 08:14:14] JOIN: alice joined room 'networking'
+[2026-10-04 08:14:23] JOIN: bob joined room 'networking'
+[2026-10-04 08:14:26] JOIN: dave joined room 'networking'
+[2026-10-04 08:14:31] JOIN: erin joined room 'networking'
+[2026-10-04 08:14:50] RMSG: alice to room 'networking': 'Hello networking room'
+[2026-10-04 08:17:25] REGISTER: User 'Carol' registered.
+[2026-10-04 08:18:40] LEAVE: Carol left room 'networking'
+[2026-10-04 08:21:29] SENDFILE: alice -> bob: 'test.txt' (32 bytes)
+[2026-10-04 08:37:40] QUIT: bob
+[2026-10-04 08:37:40] DISCONNECT: User 'bob' disconnected.
