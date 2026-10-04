@@ -1,0 +1,11 @@
+CC = gcc
+CFLAGS = -Wall -g -pthread
+TARGET = server_5634
+
+all: $(TARGET)
+
+$(TARGET): server_5634.c
+	$(CC) $(CFLAGS) -o $(TARGET) server_5634.c
+
+clean:
+	rm -f $(TARGET)
